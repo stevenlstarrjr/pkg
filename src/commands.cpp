@@ -24,6 +24,9 @@
 namespace pkg {
 namespace {
 
+int runApply(const std::filesystem::path& root,
+             const std::vector<std::string>& args);
+
 void printUsage() {
   std::cout
       << "Usage:\n"
