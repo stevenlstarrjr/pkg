@@ -35,6 +35,8 @@ void printUsage() {
       << "  pkg resolve <port> [<port> ...] [--root <path>]\n"
       << "  pkg build --group <name> [--root <path>]\n"
       << "  pkg build <port> [<port> ...] [--root <path>] [--activate]\n"
+      << "  pkg rebuild --group <name> [--root <path>] [--activate]\n"
+      << "  pkg rebuild <port> [<port> ...] [--root <path>] [--activate]\n"
       << "  pkg package --group <name> [--root <path>] [--out <path>]\n"
       << "  pkg package <port> [<port> ...] [--root <path>] [--out <path>]\n"
       << "  pkg download --group <name> [--root <path>] [--activate]\n"
@@ -986,8 +988,9 @@ int runResolve(const std::filesystem::path& root,
   return 0;
 }
 
-int runBuild(const std::filesystem::path& root,
-             const std::vector<std::string>& args) {
+int runBuildLike(const std::filesystem::path& root,
+                 const std::vector<std::string>& args,
+                 bool force_rebuild) {
   Config cfg;
   Group group;
   auto resolved = resolveFromArgs(root, args, &cfg, &group);
@@ -1001,7 +1004,7 @@ int runBuild(const std::filesystem::path& root,
   lock.state = "planned";
   {
     std::ostringstream cmd;
-    cmd << "pkg build";
+    cmd << (force_rebuild ? "pkg rebuild" : "pkg build");
     for (size_t i = 1; i < args.size(); ++i) {
       cmd << " " << args[i];
     }
@@ -1082,7 +1085,8 @@ int runBuild(const std::filesystem::path& root,
       continue;
     }
 
-    if (std::filesystem::exists(store_dir) &&
+    if (!force_rebuild &&
+        std::filesystem::exists(store_dir) &&
         !std::filesystem::is_empty(store_dir, ec)) {
       entry.status = "reused";
       entry.build_seconds = 0;
@@ -1320,6 +1324,16 @@ int runBuild(const std::filesystem::path& root,
   }
 
   return 0;
+}
+
+int runBuild(const std::filesystem::path& root,
+             const std::vector<std::string>& args) {
+  return runBuildLike(root, args, false);
+}
+
+int runRebuild(const std::filesystem::path& root,
+               const std::vector<std::string>& args) {
+  return runBuildLike(root, args, true);
 }
 
 int runPackage(const std::filesystem::path& root,
@@ -1650,6 +1664,9 @@ int Commands::run(int argc, char** argv) {
   }
   if (command == "build") {
     return runBuild(root, args);
+  }
+  if (command == "rebuild") {
+    return runRebuild(root, args);
   }
   if (command == "package") {
     return runPackage(root, args);
