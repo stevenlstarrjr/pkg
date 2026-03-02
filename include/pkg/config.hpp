@@ -34,11 +34,16 @@ struct ProfileConfig {
   int generations_to_keep = 5;
 };
 
+struct PackageConfig {
+  std::string source_dir = "build/packages";
+};
+
 struct Config {
   LayoutConfig layout;
   ResolverConfig resolver;
   BuildConfig build;
   ProfileConfig profile;
+  PackageConfig packages;
 };
 
 class ConfigStore {

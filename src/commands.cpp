@@ -31,7 +31,13 @@ void printUsage() {
       << "  pkg resolve --group <name> [--root <path>]\n"
       << "  pkg resolve <port> [<port> ...] [--root <path>]\n"
       << "  pkg build --group <name> [--root <path>]\n"
-      << "  pkg build <port> [<port> ...] [--root <path>]\n"
+      << "  pkg build <port> [<port> ...] [--root <path>] [--activate]\n"
+      << "  pkg package --group <name> [--root <path>] [--out <path>]\n"
+      << "  pkg package <port> [<port> ...] [--root <path>] [--out <path>]\n"
+      << "  pkg download --group <name> [--root <path>] [--activate]\n"
+      << "  pkg download <port> [<port> ...] [--root <path>] [--activate]\n"
+      << "  pkg activate --group <name> [--root <path>]\n"
+      << "  pkg activate --profile <name-or-path> [--root <path>]\n"
       << "  pkg apply [--root <path>] [--group <name>] [--profile <name-or-path>] "
          "[--activate-target <path>] [--force]\n";
 }
@@ -907,7 +913,8 @@ Result<ResolveResult> resolveFromArgs(const std::filesystem::path& root,
 
 Result<Lockfile> lockfileForResolved(const std::filesystem::path& root,
                                      const Config& cfg,
-                                     const ResolveResult& resolved) {
+                                     const ResolveResult& resolved,
+                                     bool require_store = true) {
   Lockfile lock;
   for (const auto& name : resolved.order) {
     const auto& recipe = resolved.nodes.at(name).recipe;
@@ -920,11 +927,13 @@ Result<Lockfile> lockfileForResolved(const std::filesystem::path& root,
                   hashKey(recipe.name + "@" + recipe.version).substr(0, 12) +
                   "-" + recipe.name + "-" + recipe.version;
     entry.deps = recipe.deps;
-    const auto store_dir = root / entry.store;
-    if (!std::filesystem::exists(store_dir) || std::filesystem::is_empty(store_dir)) {
-      return Status{StatusCode::kNotFound,
-                    "Store path missing for apply: " + recipe.name + " at " +
-                        store_dir.string()};
+    if (require_store) {
+      const auto store_dir = root / entry.store;
+      if (!std::filesystem::exists(store_dir) || std::filesystem::is_empty(store_dir)) {
+        return Status{StatusCode::kNotFound,
+                      "Store path missing for apply: " + recipe.name + " at " +
+                          store_dir.string()};
+      }
     }
     lock.entries.push_back(std::move(entry));
   }
@@ -1266,7 +1275,191 @@ int runBuild(const std::filesystem::path& root,
             << " failed=" << failed_count
             << " skipped=" << skipped_count
             << " planned=" << planned_count << "\n";
-  return has_failure ? 1 : 0;
+  if (has_failure) {
+    return 1;
+  }
+
+  if (hasFlag(args, "--activate")) {
+    std::vector<std::string> apply_args;
+    apply_args.emplace_back("apply");
+    const auto group_name = parseGroup(args);
+    if (!group_name.empty()) {
+      apply_args.emplace_back("--group");
+      apply_args.emplace_back(group_name);
+    }
+    return runApply(root, apply_args);
+  }
+
+  return 0;
+}
+
+int runPackage(const std::filesystem::path& root,
+               const std::vector<std::string>& args) {
+  Config cfg;
+  auto resolved = resolveFromArgs(root, args, &cfg, nullptr);
+  if (!resolved.ok()) {
+    printStatusError(resolved.status());
+    return 1;
+  }
+
+  auto lockfile = lockfileForResolved(root, cfg, resolved.value(), false);
+  if (!lockfile.ok()) {
+    printStatusError(lockfile.status());
+    return 1;
+  }
+
+  auto out_dir_text = parseOptionValue(args, "--out");
+  std::filesystem::path out_dir;
+  if (!out_dir_text.empty()) {
+    out_dir = out_dir_text;
+    if (!out_dir.is_absolute()) {
+      out_dir = root / out_dir;
+    }
+  } else {
+    out_dir = root / cfg.layout.build_dir / "packages";
+  }
+
+  std::error_code ec;
+  std::filesystem::create_directories(out_dir, ec);
+  if (ec) {
+    printStatusError(Status{StatusCode::kIoError,
+                            "Failed to create package output dir: " +
+                                out_dir.string()});
+    return 1;
+  }
+
+  const auto logs_dir = root / cfg.layout.build_dir / "logs";
+  std::filesystem::create_directories(logs_dir, ec);
+  if (ec) {
+    printStatusError(Status{StatusCode::kIoError,
+                            "Failed to create logs dir: " + logs_dir.string()});
+    return 1;
+  }
+
+  int packaged_count = 0;
+  for (const auto& entry : lockfile.value().entries) {
+    const std::filesystem::path store_dir = root / entry.store;
+    const std::string store_dir_name = store_dir.filename().string();
+    const std::filesystem::path artifact_path = out_dir / (store_dir_name + ".pkg");
+    const std::filesystem::path log_path =
+        logs_dir / (entry.name + "-" + entry.version + ".package.log");
+
+    std::filesystem::remove(artifact_path, ec);
+    ec.clear();
+
+    auto s = runCommandToLog(
+        "tar -C " + shellQuote(store_dir.parent_path().string()) + " -cf - " +
+            shellQuote(store_dir_name) + " | zstd -q -19 -o " +
+            shellQuote(artifact_path.string()),
+        log_path,
+        true);
+    if (!s.ok()) {
+      printStatusError(s);
+      return 1;
+    }
+
+    std::cout << "package: wrote " << artifact_path.string() << "\n";
+    ++packaged_count;
+  }
+
+  std::cout << "package: created " << packaged_count << " package artifacts in "
+            << out_dir.string() << "\n";
+  return 0;
+}
+
+int runDownload(const std::filesystem::path& root,
+                const std::vector<std::string>& args) {
+  Config cfg;
+  auto resolved = resolveFromArgs(root, args, &cfg, nullptr);
+  if (!resolved.ok()) {
+    printStatusError(resolved.status());
+    return 1;
+  }
+
+  auto lockfile = lockfileForResolved(root, cfg, resolved.value());
+  if (!lockfile.ok()) {
+    printStatusError(lockfile.status());
+    return 1;
+  }
+
+  std::filesystem::path from_dir = cfg.packages.source_dir;
+  if (!from_dir.is_absolute()) {
+    from_dir = root / from_dir;
+  }
+
+  const bool activate = hasFlag(args, "--activate");
+  const auto logs_dir = root / cfg.layout.build_dir / "logs";
+  std::error_code ec;
+  std::filesystem::create_directories(logs_dir, ec);
+  if (ec) {
+    printStatusError(Status{StatusCode::kIoError,
+                            "Failed to create logs dir: " + logs_dir.string()});
+    return 1;
+  }
+
+  int extracted_count = 0;
+  for (const auto& entry : lockfile.value().entries) {
+    const std::filesystem::path store_dir = root / entry.store;
+    if (std::filesystem::exists(store_dir) && !std::filesystem::is_empty(store_dir)) {
+      std::cout << "download: reused " << store_dir.string() << "\n";
+      continue;
+    }
+
+    const std::string store_dir_name = store_dir.filename().string();
+    const std::filesystem::path artifact_path = from_dir / (store_dir_name + ".pkg");
+    if (!std::filesystem::exists(artifact_path)) {
+      printStatusError(Status{StatusCode::kNotFound,
+                              "Package artifact missing: " + artifact_path.string()});
+      return 1;
+    }
+
+    std::filesystem::create_directories(store_dir.parent_path(), ec);
+    if (ec) {
+      printStatusError(Status{StatusCode::kIoError,
+                              "Failed to create store dir parent: " +
+                                  store_dir.parent_path().string()});
+      return 1;
+    }
+
+    const std::filesystem::path log_path =
+        logs_dir / (entry.name + "-" + entry.version + ".download.log");
+    auto s = runCommandToLog(
+        "zstd -dc " + shellQuote(artifact_path.string()) + " | tar -C " +
+            shellQuote(store_dir.parent_path().string()) + " -xf -",
+        log_path,
+        true);
+    if (!s.ok()) {
+      printStatusError(s);
+      return 1;
+    }
+
+    if (!std::filesystem::exists(store_dir) || std::filesystem::is_empty(store_dir)) {
+      printStatusError(Status{StatusCode::kInternalError,
+                              "Extracted package missing store dir: " +
+                                  store_dir.string()});
+      return 1;
+    }
+
+    std::cout << "download: extracted " << artifact_path.string() << " -> "
+              << store_dir.string() << "\n";
+    ++extracted_count;
+  }
+
+  std::cout << "download: extracted " << extracted_count << " package artifacts from "
+            << from_dir.string() << "\n";
+
+  if (activate) {
+    std::vector<std::string> apply_args;
+    apply_args.emplace_back("apply");
+    const auto group_name = parseGroup(args);
+    if (!group_name.empty()) {
+      apply_args.emplace_back("--group");
+      apply_args.emplace_back(group_name);
+    }
+    return runApply(root, apply_args);
+  }
+
+  return 0;
 }
 
 int runApply(const std::filesystem::path& root, const std::vector<std::string>& args) {
@@ -1392,6 +1585,17 @@ int runApply(const std::filesystem::path& root, const std::vector<std::string>& 
   return 0;
 }
 
+int runActivate(const std::filesystem::path& root,
+                const std::vector<std::string>& args) {
+  std::vector<std::string> apply_args;
+  apply_args.reserve(args.size());
+  apply_args.emplace_back("apply");
+  for (size_t i = 1; i < args.size(); ++i) {
+    apply_args.push_back(args[i]);
+  }
+  return runApply(root, apply_args);
+}
+
 }  // namespace
 
 int Commands::run(int argc, char** argv) {
@@ -1417,6 +1621,15 @@ int Commands::run(int argc, char** argv) {
   }
   if (command == "build") {
     return runBuild(root, args);
+  }
+  if (command == "package") {
+    return runPackage(root, args);
+  }
+  if (command == "download") {
+    return runDownload(root, args);
+  }
+  if (command == "activate") {
+    return runActivate(root, args);
   }
   if (command == "apply") {
     return runApply(root, args);

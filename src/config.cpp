@@ -46,6 +46,10 @@ Result<Config> ConfigStore::load(const std::filesystem::path& root) {
     if (auto v = toml_util::getInt(*profile, "generations_to_keep")) cfg.profile.generations_to_keep = *v;
   }
 
+  if (auto packages = top.get("packages"); packages.has_value() && packages->is_table()) {
+    if (auto v = toml_util::getString(*packages, "source_dir")) cfg.packages.source_dir = *v;
+  }
+
   return cfg;
 }
 
