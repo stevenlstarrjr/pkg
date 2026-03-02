@@ -775,13 +775,39 @@ Status updateActivationSymlink(const std::filesystem::path& root,
   return Status::Ok();
 }
 
+std::filesystem::path discoverRootFrom(const std::filesystem::path& start) {
+  std::error_code ec;
+  auto current = std::filesystem::absolute(start, ec);
+  if (ec) {
+    return start;
+  }
+
+  while (true) {
+    if (std::filesystem::exists(current / ConfigStore::kConfigFilename, ec)) {
+      return current;
+    }
+    const auto parent = current.parent_path();
+    if (parent.empty() || parent == current) {
+      break;
+    }
+    current = parent;
+  }
+
+  const std::filesystem::path default_root = "/usr/ports";
+  if (std::filesystem::exists(default_root / ConfigStore::kConfigFilename, ec)) {
+    return default_root;
+  }
+
+  return start;
+}
+
 std::filesystem::path parseRoot(const std::vector<std::string>& args) {
   for (size_t i = 0; i + 1 < args.size(); ++i) {
     if (args[i] == "--root") {
       return args[i + 1];
     }
   }
-  return std::filesystem::current_path();
+  return discoverRootFrom(std::filesystem::current_path());
 }
 
 std::string parseGroup(const std::vector<std::string>& args) {
